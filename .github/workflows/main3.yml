@@ -1,0 +1,140 @@
+name: Android APK CI
+
+on:
+
+  workflow_dispatch: # allows manual triggering
+
+    inputs:
+
+      create_release:
+
+        description: 'Create new release'
+
+        required: true
+
+        type: boolean
+
+  push:
+
+    paths: ['.github/workflows/**', '**/CMakeLists.txt', '**/Makefile', '**/*.h', '**/*.c', '**/*.cpp']
+
+  pull_request:
+
+    types: [opened, synchronize, edited, reopened, review_requested, ready_for_review]
+
+    paths: ['**/CMakeLists.txt', '**/Makefile', '**/*.h', '**/*.c', '**/*.cpp']
+
+env:
+
+  BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
+
+jobs:
+
+  android-build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout
+
+        id: checkout
+
+        uses: actions/checkout@v1
+
+      - name: Install Dependencies
+
+        id: dependencies
+
+        run: |
+
+          sudo apt-get update
+
+          sudo apt-get install build-essential cmake ninja-build
+
+      - name: Setup Java
+
+        id: java
+
+        uses: actions/setup-java@v2
+
+        with:
+
+          java-version: '11'
+
+          distribution: 'adopt'
+
+      - name: Setup Android SDK
+
+        id: sdk
+
+        uses: android-actions/setup-android@v3
+
+        with:
+
+          api-level: 30
+
+          ndk-version: '23.0.7599858'
+
+          cmake-version: '3.18.1'
+
+          build-tools-version: '30.0.3'
+
+      - name: Build Android APK
+
+        id: apk_build
+
+        run: |
+
+          mkdir build
+
+          cd build
+
+          cmake .. -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake -DANDROID_ABI=armeabi-v7a -DANDROID_PLATFORM=android-30 -DANDROID_STL=c++_shared -DANDROID_ARM_NEON=ON -DCMAKE_BUILD_TYPE=Release -G Ninja
+
+          cmake --build . --config Release
+
+      - name: Sign APK
+
+        id: sign_apk
+
+        run: |
+
+          cd build
+
+          echo "${{ secrets.KEYSTORE }}" > keystore.jks
+
+          echo "${{ secrets.KEYSTORE_PROPERTIES }}" > keystore.properties
+
+          ./gradlew assembleRelease --stacktrace
+
+      - name: Get commit hash
+
+        id: commit
+
+        if: ${{ ( github.event_name == 'push' && github.ref == 'refs/heads/master' ) || github.event.inputs.create_release == 'true' }}
+
+        uses: pr-mpt/actions-commit-hash@v2
+
+      - name: Pack artifacts
+
+        id: pack_artifacts
+
+        if: ${{ ( github.event_name == 'push' && github.ref == 'refs/heads/master' ) || github.event.inputs.create_release == 'true' }}
+
+        run: |
+
+          cp ./build/app/outputs/apk/release/app-release.apk llama-${{ env.BRANCH_NAME }}-${{ steps.commit.outputs.short }}-android.apk
+
+      - name: Upload artifacts
+
+        if: ${{ ( github.event_name == 'push' && github.ref == 'refs/heads/master' ) || github.event.inputs.create_release == 'true' }}
+
+        uses: actions/upload-artifact@v3
+
+        with:
+
+          path: |
+
+            llama-${{ env.BRANCH_NAME }}-${{ steps.commit.outputs.short }}-android.apk
+
