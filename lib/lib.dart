@@ -16,6 +16,7 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:sherpa/ModelFilePath.dart';
 
 import 'package:sherpa/generated_bindings_llama.dart';
+import 'package:sherpa/main.dart';
 
 // import 'package:sherpa/generated_bindings.dart';
 // import 'package:sherpa/llama_bindings.dart';
@@ -136,6 +137,8 @@ extension VectorIntExtension on Vector<Int> {
 class Lib {
   Isolate? _isolate;
 
+  static bool stopGeneration = false;
+
   Lib();
 
   Pointer<Pointer<Char>> strListToPointer(List<String> strings) {
@@ -225,6 +228,10 @@ class Lib {
             mainSendPort: mainSendPort,
           );
         }
+        if (message is MessageStopGeneration) {
+          log("[isolate] Stopping generation");
+          stopGeneration = true;
+        }
       });
     } catch (e) {
       mainSendPort.send("[isolate] ERROR : $e");
@@ -245,7 +252,7 @@ class Lib {
     required void Function(String log) printLog,
     required String promptPassed,
     required void Function() done,
-    required String stopToken,
+    required String stopToken, required ParamsLlamaValuesOnly paramsLlamaValuesOnly,
   }) async {
     ByteData libAndroid = await rootBundle.load('assets/libs/libllama.so');
     ByteData? libWindows;
@@ -274,6 +281,7 @@ class Lib {
           rootIsolateToken: token,
           promptPassed: promptPassed,
           stopToken: stopToken,
+          paramsLlamaValuesOnly: paramsLlamaValuesOnly,
         ));
       } else if (message is MessageEndFromIsolate) {
         printLnLog("MessageEndFromIsolate : ${message.message}");
@@ -377,28 +385,35 @@ class Lib {
     // print("initialize found : ${main.providesSymbol('initialize')}");
 
     var gptParams = malloc.allocate<gpt_params>(sizeOf<gpt_params>());
-    gptParams.ref.seed = -1; // RNG seed
-    gptParams.ref.n_threads = 4;
-    gptParams.ref.n_predict = 256; // new tokens to predict
-    gptParams.ref.repeat_last_n = 64; // last n tokens to penalize
-    gptParams.ref.n_parts =
-        -1; // amount of model parts (-1 = determine from model dimensions)
-    gptParams.ref.n_ctx = 512; // context size
-    gptParams.ref.top_k = 40;
-    gptParams.ref.top_p = 0.9;
-    gptParams.ref.temp = 0.80;
-    gptParams.ref.repeat_penalty = 1.10;
-    gptParams.ref.n_batch = 8; // batch size for prompt processing
-    gptParams.ref.memory_f16 = false; // use f16 instead of f32 for memory kv
-    gptParams.ref.random_prompt =
-        false; // do not randomize prompt if none provided
-    gptParams.ref.use_color =
-        false; // use color to distinguish generations and inputs
-    gptParams.ref.interactive = true; // interactive mode
-    gptParams.ref.interactive_start = false; // wait for user input immediately
-    gptParams.ref.instruct = true; // instruction mode (used for Alpaca models)
-    gptParams.ref.ignore_eos = false; // do not stop generating after eos
-    gptParams.ref.perplexity = false;
+    gptParams.ref.seed = int.parse(parsingDemand.paramsLlamaValuesOnly.seed);
+    gptParams.ref.n_threads = int.parse(
+        parsingDemand.paramsLlamaValuesOnly.n_threads); // number of threads
+    gptParams.ref.n_predict = int.parse(
+        parsingDemand.paramsLlamaValuesOnly.n_predict); // number of predictions
+    gptParams.ref.repeat_last_n = int.parse(
+        parsingDemand.paramsLlamaValuesOnly.repeat_last_n); // repeat last n tokens
+    gptParams.ref.n_parts = int.parse(
+        parsingDemand.paramsLlamaValuesOnly.n_parts); // number of parts
+    gptParams.ref.n_ctx = int.parse(
+        parsingDemand.paramsLlamaValuesOnly.n_ctx); // number of tokens in context
+    gptParams.ref.top_k = int.parse(
+        parsingDemand.paramsLlamaValuesOnly.top_k); // top k sampling
+    gptParams.ref.top_p = double.parse(
+        parsingDemand.paramsLlamaValuesOnly.top_p); // top p sampling
+    gptParams.ref.temp = double.parse(
+        parsingDemand.paramsLlamaValuesOnly.temp); // temperature
+    gptParams.ref.repeat_penalty = double.parse(
+        parsingDemand.paramsLlamaValuesOnly.repeat_penalty); // repeat penalty
+    gptParams.ref.n_batch = int.parse(
+        parsingDemand.paramsLlamaValuesOnly.n_batch); // number of batches
+    gptParams.ref.memory_f16 = parsingDemand.paramsLlamaValuesOnly.memory_f16;
+    gptParams.ref.random_prompt = parsingDemand.paramsLlamaValuesOnly.random_prompt;
+    gptParams.ref.use_color = parsingDemand.paramsLlamaValuesOnly.use_color;
+    gptParams.ref.interactive = parsingDemand.paramsLlamaValuesOnly.interactive;
+    gptParams.ref.interactive_start = parsingDemand.paramsLlamaValuesOnly.interactive_start;
+    gptParams.ref.instruct = parsingDemand.paramsLlamaValuesOnly.instruct;
+    gptParams.ref.ignore_eos = parsingDemand.paramsLlamaValuesOnly.ignore_eos;
+    gptParams.ref.perplexity = parsingDemand.paramsLlamaValuesOnly.perplexity;
     var params = gptParams.ref;
     log("main found : ${llama.providesSymbol('llama_context_default_params')}");
 
@@ -462,7 +477,8 @@ class Lib {
     int n_past = 0;
     log('before while loop');
     while ((remaining_tokens > 0 || gptParams.ref.interactive)) {
-      log('wile : $remaining_tokens');
+      log('remaining tokens : $remaining_tokens');
+      log('stopGeneration : $stopGeneration');
       if (embd.length > 0) {
         if (llamaBinded.llama_eval(ctx, embd.pointer, embd.length, n_past,
                 gptParams.ref.n_threads) >
@@ -473,7 +489,11 @@ class Lib {
       }
       n_past += embd.length;
       embd.clear();
-
+      if (stopGeneration) {
+        log('stop Generation initiated by user');
+        interaction = Completer();
+        stopGeneration = false;
+      }
       if (embd_inp.length <= input_consumed) {
         // out of user input, sample next token
         var top_k = gptParams.ref.top_k;
@@ -553,12 +573,11 @@ class Lib {
               break;
             }
           }
-          //end of the ttlString size of stopTokenLength
         }
       }
 
       if (params.interactive && embd_inp.length <= input_consumed) {
-        log('params.interactive && embd_inp.length <= input_consumed');
+        log('params.interactive && embd_inp.length <= input_consumed && interaction.isCompleted == ${interaction.isCompleted}');
         // malloc.free(pointer);
         // malloc.free(pointer);
 
@@ -575,6 +594,7 @@ class Lib {
           // logInline(stopTokenTrimed);
           mainSendPort.send(MessageCanPrompt());
           String buffer = await interaction.future;
+          stopGeneration = false;
           // logInline(stopTokenTrimed + '\n');
 
           logInline(buffer);
@@ -597,7 +617,6 @@ class Lib {
 
       // In interactive mode, respect the maximum number of tokens and drop back to user input when reached.
       if (params.interactive && remaining_tokens <= 0) {
-        log("befire compltere");
         remaining_tokens = params.n_predict;
         interaction = Completer();
       }
@@ -620,9 +639,13 @@ class Lib {
   void main() {}
 
   void cancel() {
-    _isolate?.kill(priority: Isolate.immediate);
-    _isolate = null;
+    print('cancel. isolateSendPort is null ? ${isolateSendPort == null}');
+    isolateSendPort?.send(MessageStopGeneration());
   }
+}
+
+class MessageStopGeneration {
+  MessageStopGeneration();
 }
 
 class MessageFromIsolate {
@@ -653,8 +676,8 @@ class ParsingDemand {
   ByteData? libLinux;
   RootIsolateToken? rootIsolateToken;
   String promptPassed;
-
   String stopToken;
+  ParamsLlamaValuesOnly paramsLlamaValuesOnly;
 
   ParsingDemand({
     required this.libWindows,
@@ -663,6 +686,7 @@ class ParsingDemand {
     required this.promptPassed,
     required this.libLinux,
     required this.stopToken,
+    required this.paramsLlamaValuesOnly,
   });
 }
 
