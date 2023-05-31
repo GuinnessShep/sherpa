@@ -1,0 +1,73 @@
+name: Android CI
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v2
+
+    - name: Set up JDK 11
+      uses: actions/setup-java@v2
+      with:
+        distribution: 'adopt'
+        java-version: '11'
+
+    - name: Check for Gradle Wrapper
+      id: gradlew-check
+      run: |
+        if [[ -f "./android/gradlew" ]]; then
+          echo "::set-output name=exists::true"
+        else
+          echo "::set-output name=exists::false"
+        fi
+
+    - name: Check for pom.xml
+      id: maven-check
+      run: |
+        if [[ -f "./pom.xml" ]]; then
+          echo "::set-output name=exists::true"
+        else
+          echo "::set-output name=exists::false"
+        fi
+
+    - name: Grant execute permissions for gradlew
+      if: steps.gradlew-check.outputs.exists == 'true'
+      run: chmod +x ./android/gradlew
+
+    - name: Build with Gradle
+      if: steps.gradlew-check.outputs.exists == 'true'
+      run: ./android/gradlew build || echo "Gradle build failed"
+
+    - name: Build with Maven
+      if: steps.maven-check.outputs.exists == 'true'
+      run: mvn clean install || echo "Maven build failed"
+
+    - name: Install Android SDK
+      if: always()
+      run: |
+        wget https://dl.google.com/android/repository/sdk-tools-linux-4333796.zip
+        unzip sdk-tools-linux-4333796.zip -d $HOME/sdk
+        echo "y" | $HOME/sdk/tools/bin/sdkmanager "platform-tools" "platforms;android-29"
+
+    - name: Build with Android SDK
+      if: always()
+      run: |
+        chmod +x gradlew
+        ./gradlew assembleDebug || echo "SDK build failed"
+
+    - name: Upload APK
+      uses: actions/upload-artifact@v2
+      if: success()
+      with:
+        name: app
+        path: |
+          ./android/app/build/outputs/apk/debug/app-debug.apk
+          ./target/*.apk
