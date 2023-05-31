@@ -21,6 +21,18 @@ jobs:
         java-version: '11'
 
 
+# ...
+
+    - name: Setup Flutter
+      uses: subosito/flutter-action@v1
+      with:
+        flutter-version: '2.8.1'  # replace with your desired Flutter version
+
+    - name: Install Flutter dependencies
+      run: flutter pub get
+
+# ...
+
 
     - name: Check for Gradle Wrapper
       id: gradlew-check
