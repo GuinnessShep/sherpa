@@ -214,7 +214,7 @@ class Lib {
     ReceivePort isolateReceivePort = ReceivePort();
     SendPort isolateSendPort = isolateReceivePort.sendPort;
     mainSendPort.send(isolateSendPort);
-
+    var completer = Completer<ParsingDemand>();
     try {
       isolateReceivePort.listen((message) async {
         if (message is MessageNewPrompt) {
@@ -222,17 +222,20 @@ class Lib {
         }
         if (message is ParsingDemand) {
           // mainSendPort.send(ParsingResult(fileSaved.path));
-          binaryIsolate(
-            parsingDemand: message,
-            stopToken: message.stopToken,
-            mainSendPort: mainSendPort,
-          );
+          completer.complete(message);
         }
         if (message is MessageStopGeneration) {
           log("[isolate] Stopping generation");
           stopGeneration = true;
         }
       });
+
+      var parsingDemand = await completer.future;
+      Future.sync(() => Lib().binaryIsolate(
+            parsingDemand: parsingDemand,
+            stopToken: parsingDemand.stopToken,
+            mainSendPort: mainSendPort,
+          ) as FutureOr<void>);
     } catch (e) {
       mainSendPort.send("[isolate] ERROR : $e");
     }
@@ -252,7 +255,9 @@ class Lib {
     required void Function(String log) printLog,
     required String promptPassed,
     required void Function() done,
-    required String stopToken, required ParamsLlamaValuesOnly paramsLlamaValuesOnly,
+    required void Function() canStop,
+    required String stopToken,
+    required ParamsLlamaValuesOnly paramsLlamaValuesOnly,
   }) async {
     ByteData libAndroid = await rootBundle.load('assets/libs/libllama.so');
     ByteData? libWindows;
@@ -295,6 +300,8 @@ class Lib {
         printLnLog(message.message);
       } else if (message is MessageCanPrompt) {
         done();
+      } else if (message is MessageCanStop) {
+        canStop();
       } else {
         print(message);
       }
@@ -327,7 +334,7 @@ class Lib {
 
   static Completer interaction = Completer();
 
-  static binaryIsolate({
+  binaryIsolate({
     required ParsingDemand parsingDemand,
     required SendPort mainSendPort,
     required String stopToken,
@@ -390,30 +397,41 @@ class Lib {
         parsingDemand.paramsLlamaValuesOnly.n_threads); // number of threads
     gptParams.ref.n_predict = int.parse(
         parsingDemand.paramsLlamaValuesOnly.n_predict); // number of predictions
-    gptParams.ref.repeat_last_n = int.parse(
-        parsingDemand.paramsLlamaValuesOnly.repeat_last_n); // repeat last n tokens
+    gptParams.ref.repeat_last_n = int.parse(parsingDemand
+        .paramsLlamaValuesOnly.repeat_last_n); // repeat last n tokens
     gptParams.ref.n_parts = int.parse(
         parsingDemand.paramsLlamaValuesOnly.n_parts); // number of parts
-    gptParams.ref.n_ctx = int.parse(
-        parsingDemand.paramsLlamaValuesOnly.n_ctx); // number of tokens in context
-    gptParams.ref.top_k = int.parse(
-        parsingDemand.paramsLlamaValuesOnly.top_k); // top k sampling
+    gptParams.ref.n_ctx = int.parse(parsingDemand
+        .paramsLlamaValuesOnly.n_ctx); // number of tokens in context
+    gptParams.ref.top_k =
+        int.parse(parsingDemand.paramsLlamaValuesOnly.top_k); // top k sampling
     gptParams.ref.top_p = double.parse(
         parsingDemand.paramsLlamaValuesOnly.top_p); // top p sampling
-    gptParams.ref.temp = double.parse(
-        parsingDemand.paramsLlamaValuesOnly.temp); // temperature
+    gptParams.ref.temp =
+        double.parse(parsingDemand.paramsLlamaValuesOnly.temp); // temperature
     gptParams.ref.repeat_penalty = double.parse(
         parsingDemand.paramsLlamaValuesOnly.repeat_penalty); // repeat penalty
     gptParams.ref.n_batch = int.parse(
         parsingDemand.paramsLlamaValuesOnly.n_batch); // number of batches
     gptParams.ref.memory_f16 = parsingDemand.paramsLlamaValuesOnly.memory_f16;
-    gptParams.ref.random_prompt = parsingDemand.paramsLlamaValuesOnly.random_prompt;
+    gptParams.ref.random_prompt =
+        parsingDemand.paramsLlamaValuesOnly.random_prompt;
     gptParams.ref.use_color = parsingDemand.paramsLlamaValuesOnly.use_color;
     gptParams.ref.interactive = parsingDemand.paramsLlamaValuesOnly.interactive;
-    gptParams.ref.interactive_start = parsingDemand.paramsLlamaValuesOnly.interactive_start;
+    gptParams.ref.interactive_start =
+        parsingDemand.paramsLlamaValuesOnly.interactive_start;
     gptParams.ref.instruct = parsingDemand.paramsLlamaValuesOnly.instruct;
     gptParams.ref.ignore_eos = parsingDemand.paramsLlamaValuesOnly.ignore_eos;
     gptParams.ref.perplexity = parsingDemand.paramsLlamaValuesOnly.perplexity;
+
+    gptParams.ref.use_mlock = false; // use mlock to keep model in memory
+    gptParams.ref.mem_test = false; // compute maximum memory usage
+    gptParams.ref.verbose_prompt =
+        false; // print prompt tokens before generation
+    gptParams.ref.n_keep = 0;
+    gptParams.ref.embedding = false;
+    gptParams.ref.use_mmap = true;
+
     var params = gptParams.ref;
     log("main found : ${llama.providesSymbol('llama_context_default_params')}");
 
@@ -421,6 +439,13 @@ class Lib {
 
     var ret = llamaBinded.llama_context_default_params();
     log("trying main DONE $ret");
+
+    ret.n_ctx = params.n_ctx;
+    ret.n_parts = params.n_parts;
+    ret.seed = params.seed;
+    ret.f16_kv = params.memory_f16;
+    ret.use_mmap = params.use_mmap;
+    ret.use_mlock = params.use_mlock;
 
     var filePath = await ModelFilePath.getFilePath();
     print("filePath : $filePath");
@@ -431,7 +456,8 @@ class Lib {
 
     var ctx = llamaBinded.llama_init_from_file(
         filePath.toNativeUtf8().cast<Char>(), ret);
-    if (ctx == nullptr || ctx.cast<Int64>().value != 0) {
+    // || ctx.cast<Int64>().value != 0
+    if (ctx == nullptr) {
       log("context error : ${CreationContextError(ctx.cast<Int64>().value).toString()}");
       llamaBinded.llama_free(ctx);
       return;
@@ -460,6 +486,7 @@ class Lib {
 
     var inp_pfx = tokenize(llamaBinded, ctx, "\n\n### Instruction:\n\n", true);
     var inp_sfx = tokenize(llamaBinded, ctx, "\n\n### Response:\n\n", false);
+    var user_token = tokenize(llamaBinded, ctx, "\n$stopTokenTrimed", true);
     var llama_token_newline = tokenize(llamaBinded, ctx, "\n", false);
 
     var embd = Vector<Int>(nullptr, 0);
@@ -476,6 +503,8 @@ class Lib {
     int remaining_tokens = gptParams.ref.n_predict;
     int n_past = 0;
     log('before while loop');
+    mainSendPort.send(MessageCanStop());
+
     while ((remaining_tokens > 0 || gptParams.ref.interactive)) {
       log('remaining tokens : $remaining_tokens');
       log('stopGeneration : $stopGeneration');
@@ -486,15 +515,17 @@ class Lib {
           log("error llama_eval");
           return;
         }
+        await Future.delayed(Duration(milliseconds: 1));
       }
       n_past += embd.length;
       embd.clear();
       if (stopGeneration) {
-        log('stop Generation initiated by user');
         interaction = Completer();
         stopGeneration = false;
+        embd.insertVectorAtEnd(user_token);
       }
-      if (embd_inp.length <= input_consumed) {
+      if (embd_inp.length <= input_consumed &&
+          interaction.isCompleted == true) {
         // out of user input, sample next token
         var top_k = gptParams.ref.top_k;
         var top_p = gptParams.ref.top_p;
@@ -551,27 +582,32 @@ class Lib {
       log('input_noecho = $input_noecho   embd.length = ${embd.length}');
       if (!input_noecho) {
         for (int i = 0; i < embd.length; ++i) {
-          int id = embd.pointer[i];
-          var str = llamaBinded
-              .llama_token_to_str(ctx, id)
-              .cast<Utf8>()
-              .toDartString();
-          logInline(str);
-          ttlString += str;
-          if (ttlString.length >= stopTokenLength &&
-              ttlString.length > prompt.length &&
-              stopTokenLength > 0) {
-            var lastPartTtlString = ttlString
-                .trim()
-                .substring(ttlString.trim().length - stopTokenLength - 1)
-                .toLowerCase()
-                .replaceAll(' ', '');
-            log('lastPartTtlString = $lastPartTtlString , stopTokenTrimed = $stopTokenTrimed');
-            if (lastPartTtlString == stopTokenTrimed.toLowerCase()) {
-              log('is_interacting = true');
-              interaction = Completer();
-              break;
+          try {
+            int id = embd.pointer[i];
+            var str = llamaBinded
+                .llama_token_to_str(ctx, id)
+                .cast<Utf8>()
+                .toDartString();
+            logInline(str);
+            ttlString += str;
+            if (ttlString.length >= stopTokenLength &&
+                ttlString.length > prompt.length &&
+                stopTokenLength > 0) {
+              var lastPartTtlString = ttlString
+                  .trim()
+                  .substring(ttlString.trim().length - stopTokenLength - 1)
+                  .toLowerCase()
+                  .replaceAll(' ', '')
+                  .trim();
+              log('lastPartTtlString = $lastPartTtlString , stopTokenTrimed = ${stopTokenTrimed.toLowerCase()}, equal = ${lastPartTtlString == stopTokenTrimed.toLowerCase()}');
+              if (lastPartTtlString == stopTokenTrimed.toLowerCase()) {
+                log('is_interacting = true');
+                interaction = Completer();
+                break;
+              }
             }
+          } catch (e) {
+            interaction = Completer();
           }
         }
       }
@@ -662,6 +698,10 @@ class MessageNewLineFromIsolate {
 
 class MessageCanPrompt {
   MessageCanPrompt();
+}
+
+class MessageCanStop {
+  MessageCanStop();
 }
 
 class MessageNewPrompt {
